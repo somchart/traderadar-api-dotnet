@@ -690,6 +690,12 @@ const SUGGESTIONS = [
 // ============================================================
 const CACHE = {};
 const CACHE_TTL = 55000;
+// AbortSignal.timeout polyfill — works in all browsers including Safari
+function abortAfter(ms){
+  const ctrl=new AbortController();
+  setTimeout(()=>ctrl.abort(),ms);
+  return ctrl.signal;
+}
 function sc(k,v,ttl=CACHE_TTL){CACHE[k]={v,exp:Date.now()+ttl};}
 function gc(k){const c=CACHE[k];return(c&&Date.now()<c.exp)?c.v:null;}
 
@@ -726,7 +732,7 @@ async function apiFetch(endpoint){
 
   const res = await fetch(`${base}${endpoint}`, {
     headers: { 'X-API-Key': window.BACKEND_KEY || '' },
-    signal: AbortSignal.timeout(15000),
+    signal: abortAfter(15000),
   });
   if(!res.ok){
     const err = await res.json().catch(()=>({}));
@@ -989,11 +995,11 @@ async function loadFG(){
         const resp = await apiFetch('/api/fear-greed');
         value = resp.value; lbl = resp.classification;
       }catch{
-        const r=await fetch('https://api.alternative.me/fng/?limit=1',{signal:AbortSignal.timeout(6000)});
+        const r=await fetch('https://api.alternative.me/fng/?limit=1',{signal:abortAfter(6000)});
         const d=await r.json(); value=parseInt(d.data[0].value); lbl=d.data[0].value_classification;
       }
     } else {
-      const r=await fetch('https://api.alternative.me/fng/?limit=1',{signal:AbortSignal.timeout(6000)});
+      const r=await fetch('https://api.alternative.me/fng/?limit=1',{signal:abortAfter(6000)});
       if(!r.ok) throw new Error('HTTP '+r.status);
       const d=await r.json(); value=parseInt(d.data[0].value); lbl=d.data[0].value_classification;
     }
@@ -1753,7 +1759,7 @@ async function callAI(messages, maxTokens=1000) {
         method:'POST',
         headers:{'Content-Type':'application/json','X-API-Key':window.BACKEND_KEY||''},
         body:JSON.stringify({messages, max_tokens:maxTokens}),
-        signal:AbortSignal.timeout(35000),
+        signal:abortAfter(35000),
       });
       if(res.status===503){
         const e=await res.json().catch(()=>({}));
@@ -1775,7 +1781,7 @@ async function callAI(messages, maxTokens=1000) {
   const r = await fetch('https://api.anthropic.com/v1/messages',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    signal:AbortSignal.timeout(35000),
+    signal:abortAfter(35000),
     body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:maxTokens,messages}),
   });
   if(!r.ok){
@@ -1926,7 +1932,7 @@ async function runQuickTest(){
     const statusEl=row.querySelector('.conn-status');
     const start=performance.now();
     try{
-      const r=await fetch(t.url,{headers:t.headers,signal:AbortSignal.timeout(10000)});
+      const r=await fetch(t.url,{headers:t.headers,signal:abortAfter(10000)});
       const lat=Math.round(performance.now()-start);
       const ok=t.expectStatus?r.status===t.expectStatus:r.ok;
       const d=await r.json().catch(()=>({}));
@@ -1970,7 +1976,7 @@ const CONN_TESTS = [
   { id:'backend', name:'🚂 Backend /health', critical:true, fn:async()=>{
     const b=getApiBase();
     if(!b) throw new Error('ตั้งค่า API Key ก่อน (ในส่วน "ตั้งค่า" ด้านบน)');
-    const r=await fetch(`${b}/health`,{signal:AbortSignal.timeout(10000)});
+    const r=await fetch(`${b}/health`,{signal:abortAfter(10000)});
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     const d=await r.json();
     const mode=location.hostname.includes('netlify')?'via Netlify proxy':'direct';
@@ -1980,13 +1986,13 @@ const CONN_TESTS = [
   { id:'auth', name:'🔑 API Key Auth', critical:true, fn:async()=>{
     const b=getApiBase(), key=window.BACKEND_KEY||'';
     if(!b) throw new Error('ตั้งค่า API Key ก่อน');
-    const r=await fetch(`${b}/api/quote?symbols=AAPL`,{headers:{'X-API-Key':key},signal:AbortSignal.timeout(10000)});
+    const r=await fetch(`${b}/api/quote?symbols=AAPL`,{headers:{'X-API-Key':key},signal:abortAfter(10000)});
     if(r.status===401) throw new Error('API Key ผิด — ตรวจสอบ Railway Variables → API_KEY');
     if(!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.json().catch(()=>({}))).error||''}`);
     const d=await r.json();
     const price=d.quotes?.[0]?.regularMarketPrice;
     if(!price) throw new Error('ไม่มีราคา — ตรวจสอบ FINNHUB_KEY ใน Railway Variables');
-    const r2=await fetch(`${b}/api/quote?symbols=AAPL`,{headers:{'X-API-Key':'bad'},signal:AbortSignal.timeout(5000)});
+    const r2=await fetch(`${b}/api/quote?symbols=AAPL`,{headers:{'X-API-Key':'bad'},signal:abortAfter(5000)});
     if(r2.status!==401) throw new Error('Auth ไม่ reject key ผิด');
     return `AAPL:$${f(price,2)} | auth:✅ | src:${d.quotes?.[0]?._src||'?'}`;
   }},
@@ -1994,7 +2000,7 @@ const CONN_TESTS = [
   { id:'sp', name:'📈 /api/spark', critical:false, fn:async()=>{
     const b=getApiBase(), key=window.BACKEND_KEY||'';
     if(!b) throw new Error('ตั้งค่า API Key ก่อน');
-    const r=await fetch(`${b}/api/spark?symbol=AAPL&range=1mo`,{headers:{'X-API-Key':key},signal:AbortSignal.timeout(10000)});
+    const r=await fetch(`${b}/api/spark?symbol=AAPL&range=1mo`,{headers:{'X-API-Key':key},signal:abortAfter(10000)});
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     const d=await r.json();
     if(!d.count||d.count<2) throw new Error('ข้อมูลน้อยเกิน: '+d.count);
@@ -2004,7 +2010,7 @@ const CONN_TESTS = [
   { id:'fg', name:'😱 /api/fear-greed', critical:false, fn:async()=>{
     const b=getApiBase(), key=window.BACKEND_KEY||'';
     if(!b) throw new Error('ตั้งค่า API Key ก่อน');
-    const r=await fetch(`${b}/api/fear-greed`,{headers:{'X-API-Key':key},signal:AbortSignal.timeout(10000)});
+    const r=await fetch(`${b}/api/fear-greed`,{headers:{'X-API-Key':key},signal:abortAfter(10000)});
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     const d=await r.json();
     return `${d.value}/100 — ${d.classification} | cached:${d.cached}`;
@@ -2013,7 +2019,7 @@ const CONN_TESTS = [
   { id:'fx', name:'💱 /api/fx USD/THB', critical:false, fn:async()=>{
     const b=getApiBase(), key=window.BACKEND_KEY||'';
     if(!b) throw new Error('ตั้งค่า API Key ก่อน');
-    const r=await fetch(`${b}/api/fx?from=USD&to=THB`,{headers:{'X-API-Key':key},signal:AbortSignal.timeout(10000)});
+    const r=await fetch(`${b}/api/fx?from=USD&to=THB`,{headers:{'X-API-Key':key},signal:abortAfter(10000)});
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     const d=await r.json();
     return `USD/THB:${d.rate} | ${d.date}`;
@@ -2022,7 +2028,7 @@ const CONN_TESTS = [
   { id:'rate', name:'🛡️ Rate Limit', critical:false, fn:async()=>{
     const b=getApiBase(), key=window.BACKEND_KEY||'';
     if(!b) return 'ข้าม — ตั้งค่าก่อน';
-    const r=await fetch(`${b}/api/quote?symbols=MSFT`,{headers:{'X-API-Key':key},signal:AbortSignal.timeout(10000)});
+    const r=await fetch(`${b}/api/quote?symbols=MSFT`,{headers:{'X-API-Key':key},signal:abortAfter(10000)});
     if(r.status===429) throw new Error('Rate limit triggered!');
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     return `HTTP ${r.status} — ไม่ถูก rate limit ✅`;
@@ -2035,7 +2041,7 @@ const CONN_TESTS = [
       method:'POST',
       headers:{'Content-Type':'application/json','X-API-Key':key},
       body:JSON.stringify({messages:[{role:'user',content:'Say OK'}],max_tokens:10}),
-      signal:AbortSignal.timeout(25000),
+      signal:abortAfter(25000),
     });
     if(r.status===503){const d=await r.json().catch(()=>({}));throw new Error('ต้อง add ANTHROPIC_KEY ใน Railway Variables');}
     if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(String(d.error||'HTTP '+r.status));}
@@ -2047,7 +2053,7 @@ const CONN_TESTS = [
   }},
   // 8. Fear & Greed direct (alternative.me, no proxy needed)
   { id:'proxy', name:'🌐 alternative.me (direct)', critical:false, fn:async()=>{
-    const r=await fetch('https://api.alternative.me/fng/?limit=1',{signal:AbortSignal.timeout(8000)});
+    const r=await fetch('https://api.alternative.me/fng/?limit=1',{signal:abortAfter(8000)});
     if(!r.ok) throw new Error('HTTP '+r.status);
     const d=await r.json();
     return `F&G: ${d.data?.[0]?.value}/100 — ${d.data?.[0]?.value_classification}`;

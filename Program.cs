@@ -493,23 +493,43 @@ public class FinnhubService(IOptions<AppConfig> opts, SymbolMapConfig symMap, IH
                 return null;
             }
 
-            // Gold via OANDA forex endpoint
-            if (sym == "GC=F" || sym == "XAUUSD")
+            // Gold: use OANDA:XAUUSD direct quote (more reliable than forex/rates XAU)
+            if (sym == "GC=F" || sym == "XAUUSD" || sym == "GC.F")
             {
-                var fxJson = await FhGetAsync("forex/rates?base=USD");
-                using var fxDoc2 = JsonDocument.Parse(fxJson);
-                if (fxDoc2.RootElement.TryGetProperty("quote", out var q2) &&
-                    q2.TryGetProperty("XAU", out var xau))
+                // Try OANDA:XAUUSD first
+                try
                 {
-                    // XAU rate = XAU per USD, so price = 1/rate
-                    var xauPerUsd = xau.GetDecimal();
-                    var price = xauPerUsd > 0 ? Math.Round(1m / xauPerUsd, 2) : 0m;
-                    return new QuoteResult { Symbol = sym, ShortName = "Gold Spot USD",
-                        RegularMarketPrice = price, RegularMarketChange = 0,
-                        RegularMarketChangePercent = 0, Source = "finnhub-forex" };
+                    var goldResult = await GetQuoteForSymbol("OANDA:XAUUSD", sym, "Gold Spot USD");
+                    if (goldResult?.RegularMarketPrice > 0) return goldResult;
                 }
-                // Fallback: use GLD ETF
-                return await GetQuoteForSymbol("GLD", sym, "Gold (via GLD ETF)");
+                catch { }
+
+                // Fallback: GLD ETF (gold ETF, always available on free tier)
+                try
+                {
+                    var gldResult = await GetQuoteForSymbol("GLD", sym, "Gold (GLD ETF)");
+                    if (gldResult?.RegularMarketPrice > 0) return gldResult;
+                }
+                catch { }
+
+                // Last resort: forex/rates XAU
+                try
+                {
+                    var fxJson = await FhGetAsync("forex/rates?base=USD");
+                    using var fxDoc2 = JsonDocument.Parse(fxJson);
+                    if (fxDoc2.RootElement.TryGetProperty("quote", out var q2) &&
+                        q2.TryGetProperty("XAU", out var xau))
+                    {
+                        var xauPerUsd = xau.GetDecimal();
+                        var price = xauPerUsd > 0 ? Math.Round(1m / xauPerUsd, 2) : 0m;
+                        if (price > 0)
+                            return new QuoteResult { Symbol = sym, ShortName = "Gold Spot USD",
+                                RegularMarketPrice = price, RegularMarketChange = 0,
+                                RegularMarketChangePercent = 0, Source = "finnhub-forex" };
+                    }
+                }
+                catch { }
+                return null;
             }
 
             var fSym = ToFhSym(sym);
@@ -549,64 +569,37 @@ public class FinnhubService(IOptions<AppConfig> opts, SymbolMapConfig symMap, IH
         };
     }
 
+    // Finnhub free tier does NOT support candle/chart endpoints for stocks.
+    // We generate a synthetic chart using today's quote OHLC data.
+    // For a real chart, upgrade to Finnhub paid or add RapidAPI key.
     public async Task<SparkResult?> GetCandlesAsync(string sym, string range)
     {
         if (string.IsNullOrEmpty(opts.Value.FinnhubKey)) return null;
         try
         {
-            var fSym = ToFhSym(sym);
-            var now  = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            var days = range switch { "1d" => 30, "5d" => 30, "1mo" => 35, "3mo" => 95, _ => 35 };
-            var from = now - (long)days * 86400;
+            // Get current quote to use as the data point
+            var quote = await GetQuoteAsync(sym);
+            if (quote?.RegularMarketPrice is null) return null;
 
-            // Finnhub free tier: only Daily ("D") resolution for stocks
-            // Forex/crypto use forex/candle or crypto/candle endpoints
-            string json;
-            if (fSym.Contains("OANDA:") || fSym == "OANDA:XAUUSD")
-            {
-                json = await FhGetAsync(
-                    $"forex/candle?symbol={Uri.EscapeDataString(fSym)}&resolution=D&from={from}&to={now}");
-            }
-            else if (fSym.Contains("BINANCE:") || fSym.Contains("COINBASE:"))
-            {
-                json = await FhGetAsync(
-                    $"crypto/candle?symbol={Uri.EscapeDataString(fSym)}&resolution=D&from={from}&to={now}");
-            }
-            else
-            {
-                // Stock candle — daily resolution only on free tier
-                json = await FhGetAsync(
-                    $"stock/candle?symbol={Uri.EscapeDataString(fSym)}&resolution=D&from={from}&to={now}");
-            }
+            // Build a minimal synthetic SparkResult with today's OHLC
+            // This gives the chart something to display even on free tier
+            var nowTs   = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var prevTs  = nowTs - 86400;
 
-            using var doc = JsonDocument.Parse(json);
-            var root      = doc.RootElement;
-
-            if (root.TryGetProperty("s", out var st) && st.GetString() == "no_data") return null;
-            if (!root.TryGetProperty("t", out var ts)) return null;
-
-            var times = ts.EnumerateArray().Select(e => e.GetInt64()).ToList();
-            if (times.Count == 0) return null;
-
-            List<decimal?> ParseDecimals(string prop) =>
-                root.TryGetProperty(prop, out var arr)
-                ? arr.EnumerateArray().Select(e => e.ValueKind == JsonValueKind.Number
-                    ? (decimal?)Math.Round(e.GetDecimal(), 4) : null).ToList()
-                : times.Select(_ => (decimal?)null).ToList();
+            // Use previous close and today's data to create 2 points
+            var prevClose = quote.RegularMarketPreviousClose ?? quote.RegularMarketPrice.Value;
+            var curPrice  = quote.RegularMarketPrice.Value;
 
             return new SparkResult
             {
-                Timestamps = times,
-                Closes     = ParseDecimals("c"),
-                Opens      = ParseDecimals("o"),
-                Highs      = ParseDecimals("h"),
-                Lows       = ParseDecimals("l"),
-                Volumes    = root.TryGetProperty("v", out var vArr)
-                             ? vArr.EnumerateArray().Select(e => e.ValueKind == JsonValueKind.Number
-                                 ? (long?)e.GetInt64() : null).ToList()
-                             : times.Select(_ => (long?)null).ToList(),
-                Count  = times.Count,
-                Source = "finnhub",
+                Timestamps = [prevTs, nowTs],
+                Closes     = [Math.Round(prevClose, 4), Math.Round(curPrice,  4)],
+                Opens      = [Math.Round(prevClose, 4), Math.Round(quote.RegularMarketOpen      ?? curPrice, 4)],
+                Highs      = [Math.Round(prevClose, 4), Math.Round(quote.RegularMarketDayHigh   ?? curPrice, 4)],
+                Lows       = [Math.Round(prevClose, 4), Math.Round(quote.RegularMarketDayLow    ?? curPrice, 4)],
+                Volumes    = [null, quote.RegularMarketVolume],
+                Count      = 2,
+                Source     = "finnhub-quote-synthetic",
             };
         }
         catch (Exception e) { Console.WriteLine($"[spark] {sym}: {e.Message}"); return null; }
