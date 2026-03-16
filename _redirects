@@ -1,0 +1,3 @@
+# Netlify proxy — forwards /railway/* to .NET Railway backend
+# Same-origin request = no CORS issue
+/railway/*  https://traderadar-api-dotnet-production.up.railway.app/:splat  200!
