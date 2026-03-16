@@ -352,8 +352,9 @@ app.MapGet("/api/cache/clear", (CacheService cache) =>
     Results.Ok(new { ok = true, cleared = cache.Clear() }));
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-var port = Environment.GetEnvironmentVariable("PORT") ?? "3000";
-app.Urls.Add($"http://0.0.0.0:{port}");
+// Railway sets PORT env var at runtime. We override ASPNETCORE_URLS so it binds correctly.
+var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
+Environment.SetEnvironmentVariable("ASPNETCORE_URLS", $"http://+:{port}");
 
 var startupCfg = app.Services.GetRequiredService<IOptions<AppConfig>>().Value;
 Console.WriteLine($"""
