@@ -2071,9 +2071,12 @@ const CONN_TESTS = [
       signal:AbortSignal.timeout(25000),
     });
     if(r.status===503){const d=await r.json().catch(()=>({}));throw new Error('ต้อง add ANTHROPIC_KEY ใน Railway Variables');}
-    if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.error||'HTTP '+r.status);}
+    if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(String(d.error||'HTTP '+r.status));}
     const d=await r.json();
-    return `✅ Claude | "${(d.content?.[0]?.text||'').slice(0,20)}"`;
+    if(d.error) throw new Error(typeof d.error==='object'?JSON.stringify(d.error):String(d.error));
+    const text = Array.isArray(d.content)?d.content[0]?.text||'':String(d.content||'');
+    const model = typeof d.model==='string'?d.model.split('-').slice(0,2).join('-'):'claude';
+    return `✅ ${model} | "${text.slice(0,20)}"`;
   }},
   // 8. Fear & Greed direct (alternative.me, no proxy needed)
   { id:'proxy', name:'🌐 alternative.me (direct)', critical:false, fn:async()=>{

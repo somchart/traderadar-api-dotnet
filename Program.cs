@@ -467,7 +467,8 @@ public class FinnhubService(IOptions<AppConfig> opts, SymbolMapConfig symMap, IH
     private string ToFhSym(string sym)
     {
         if (symMap.Map.TryGetValue(sym, out var mapped)) return mapped;
-        if (sym.EndsWith(".BK")) return "SET:" + sym[..^3];
+        // Thai .BK stocks: try without suffix (Finnhub free doesn't support SET exchange well)
+        if (sym.EndsWith(".BK")) return sym[..^3];
         return sym;
     }
 
@@ -476,10 +477,10 @@ public class FinnhubService(IOptions<AppConfig> opts, SymbolMapConfig symMap, IH
         if (string.IsNullOrEmpty(opts.Value.FinnhubKey)) return null;
         try
         {
-            // FX special case
+            // FX special case: get THB from forex rates
             if (sym == "THBX=X")
             {
-                var fx   = await FhGetAsync("forex/rates?base=USD");
+                var fx = await FhGetAsync("forex/rates?base=USD");
                 using var fxDoc = JsonDocument.Parse(fx);
                 if (fxDoc.RootElement.TryGetProperty("quote", out var q) &&
                     q.TryGetProperty("THB", out var thb))
@@ -492,36 +493,60 @@ public class FinnhubService(IOptions<AppConfig> opts, SymbolMapConfig symMap, IH
                 return null;
             }
 
-            var fSym = ToFhSym(sym);
-            var json  = await FhGetAsync($"quote?symbol={Uri.EscapeDataString(fSym)}");
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            var c    = root.TryGetProperty("c",  out var cv)  ? cv.GetDecimal()  : 0m;
-            if (c == 0m) return null;
-            var pc   = root.TryGetProperty("pc", out var pcv) ? pcv.GetDecimal() : c;
-            var chg  = c - pc;
-            var pct  = pc != 0m ? chg / pc * 100m : 0m;
-
-            return new QuoteResult
+            // Gold via OANDA forex endpoint
+            if (sym == "GC=F" || sym == "XAUUSD")
             {
-                Symbol                     = sym,
-                ShortName                  = fSym,
-                RegularMarketPrice         = Math.Round(c,   4),
-                RegularMarketChange        = Math.Round(chg, 4),
-                RegularMarketChangePercent = Math.Round(pct, 4),
-                RegularMarketVolume        = root.TryGetProperty("v",  out var vv) ? vv.GetInt64()   : null,
-                RegularMarketOpen          = root.TryGetProperty("o",  out var ov) ? ov.GetDecimal() : null,
-                RegularMarketDayHigh       = root.TryGetProperty("h",  out var hv) ? hv.GetDecimal() : null,
-                RegularMarketDayLow        = root.TryGetProperty("l",  out var lv) ? lv.GetDecimal() : null,
-                RegularMarketPreviousClose = Math.Round(pc, 4),
-                Source                     = "finnhub",
-            };
+                var fxJson = await FhGetAsync("forex/rates?base=USD");
+                using var fxDoc2 = JsonDocument.Parse(fxJson);
+                if (fxDoc2.RootElement.TryGetProperty("quote", out var q2) &&
+                    q2.TryGetProperty("XAU", out var xau))
+                {
+                    // XAU rate = XAU per USD, so price = 1/rate
+                    var xauPerUsd = xau.GetDecimal();
+                    var price = xauPerUsd > 0 ? Math.Round(1m / xauPerUsd, 2) : 0m;
+                    return new QuoteResult { Symbol = sym, ShortName = "Gold Spot USD",
+                        RegularMarketPrice = price, RegularMarketChange = 0,
+                        RegularMarketChangePercent = 0, Source = "finnhub-forex" };
+                }
+                // Fallback: use GLD ETF
+                return await GetQuoteForSymbol("GLD", sym, "Gold (via GLD ETF)");
+            }
+
+            var fSym = ToFhSym(sym);
+            return await GetQuoteForSymbol(fSym, sym);
         }
         catch (Exception e)
         {
             Console.WriteLine($"[quote] {sym}: {e.Message}");
             return null;
         }
+    }
+
+    private async Task<QuoteResult?> GetQuoteForSymbol(string fSym, string originalSym, string? displayName = null)
+    {
+        var json = await FhGetAsync($"quote?symbol={Uri.EscapeDataString(fSym)}");
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        var c    = root.TryGetProperty("c",  out var cv)  ? cv.GetDecimal()  : 0m;
+        if (c == 0m) return null;
+        var pc  = root.TryGetProperty("pc", out var pcv) ? pcv.GetDecimal() : c;
+        var chg = c - pc;
+        var pct = pc != 0m ? chg / pc * 100m : 0m;
+
+        return new QuoteResult
+        {
+            Symbol                     = originalSym,
+            ShortName                  = displayName ?? fSym,
+            RegularMarketPrice         = Math.Round(c,   4),
+            RegularMarketChange        = Math.Round(chg, 4),
+            RegularMarketChangePercent = Math.Round(pct, 4),
+            RegularMarketVolume        = root.TryGetProperty("v",  out var vv) ? vv.GetInt64()   : null,
+            RegularMarketOpen          = root.TryGetProperty("o",  out var ov) ? ov.GetDecimal() : null,
+            RegularMarketDayHigh       = root.TryGetProperty("h",  out var hv) ? hv.GetDecimal() : null,
+            RegularMarketDayLow        = root.TryGetProperty("l",  out var lv) ? lv.GetDecimal() : null,
+            RegularMarketPreviousClose = Math.Round(pc, 4),
+            Source                     = "finnhub",
+        };
     }
 
     public async Task<SparkResult?> GetCandlesAsync(string sym, string range)
@@ -531,22 +556,42 @@ public class FinnhubService(IOptions<AppConfig> opts, SymbolMapConfig symMap, IH
         {
             var fSym = ToFhSym(sym);
             var now  = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            var days = range switch { "1d" => 2, "5d" => 7, "1mo" => 35, "3mo" => 95, _ => 35 };
+            var days = range switch { "1d" => 30, "5d" => 30, "1mo" => 35, "3mo" => 95, _ => 35 };
             var from = now - (long)days * 86400;
-            var res  = range == "1d" ? "60" : "D";
 
-            var json = await FhGetAsync(
-                $"stock/candle?symbol={Uri.EscapeDataString(fSym)}&resolution={res}&from={from}&to={now}");
-            using var doc  = JsonDocument.Parse(json);
-            var root       = doc.RootElement;
+            // Finnhub free tier: only Daily ("D") resolution for stocks
+            // Forex/crypto use forex/candle or crypto/candle endpoints
+            string json;
+            if (fSym.Contains("OANDA:") || fSym == "OANDA:XAUUSD")
+            {
+                json = await FhGetAsync(
+                    $"forex/candle?symbol={Uri.EscapeDataString(fSym)}&resolution=D&from={from}&to={now}");
+            }
+            else if (fSym.Contains("BINANCE:") || fSym.Contains("COINBASE:"))
+            {
+                json = await FhGetAsync(
+                    $"crypto/candle?symbol={Uri.EscapeDataString(fSym)}&resolution=D&from={from}&to={now}");
+            }
+            else
+            {
+                // Stock candle — daily resolution only on free tier
+                json = await FhGetAsync(
+                    $"stock/candle?symbol={Uri.EscapeDataString(fSym)}&resolution=D&from={from}&to={now}");
+            }
+
+            using var doc = JsonDocument.Parse(json);
+            var root      = doc.RootElement;
 
             if (root.TryGetProperty("s", out var st) && st.GetString() == "no_data") return null;
             if (!root.TryGetProperty("t", out var ts)) return null;
 
-            var times  = ts.EnumerateArray().Select(e => e.GetInt64()).ToList();
+            var times = ts.EnumerateArray().Select(e => e.GetInt64()).ToList();
+            if (times.Count == 0) return null;
+
             List<decimal?> ParseDecimals(string prop) =>
                 root.TryGetProperty(prop, out var arr)
-                ? arr.EnumerateArray().Select(e => e.ValueKind == JsonValueKind.Number ? (decimal?)Math.Round(e.GetDecimal(), 4) : null).ToList()
+                ? arr.EnumerateArray().Select(e => e.ValueKind == JsonValueKind.Number
+                    ? (decimal?)Math.Round(e.GetDecimal(), 4) : null).ToList()
                 : times.Select(_ => (decimal?)null).ToList();
 
             return new SparkResult
@@ -557,7 +602,8 @@ public class FinnhubService(IOptions<AppConfig> opts, SymbolMapConfig symMap, IH
                 Highs      = ParseDecimals("h"),
                 Lows       = ParseDecimals("l"),
                 Volumes    = root.TryGetProperty("v", out var vArr)
-                             ? vArr.EnumerateArray().Select(e => e.ValueKind == JsonValueKind.Number ? (long?)e.GetInt64() : null).ToList()
+                             ? vArr.EnumerateArray().Select(e => e.ValueKind == JsonValueKind.Number
+                                 ? (long?)e.GetInt64() : null).ToList()
                              : times.Select(_ => (long?)null).ToList(),
                 Count  = times.Count,
                 Source = "finnhub",
@@ -595,17 +641,20 @@ public class AnthropicService(IOptions<AppConfig> opts, IHttpClientFactory facto
     {
         try
         {
-            using var doc     = JsonDocument.Parse(requestBody);
-            var payload       = doc.RootElement.EnumerateObject()
-                                   .ToDictionary(p => p.Name, p => p.Value);
+            // Parse incoming request
+            using var doc  = JsonDocument.Parse(requestBody);
+            var payload    = doc.RootElement.EnumerateObject()
+                               .ToDictionary(p => p.Name, p => p.Value);
 
+            // Inject model if not specified
             if (!payload.ContainsKey("model"))
                 payload["model"] = JsonDocument.Parse("\"claude-sonnet-4-20250514\"").RootElement;
 
-            var http    = factory.CreateClient("anthropic");
+            // Call Anthropic
+            var http = factory.CreateClient("anthropic");
             http.DefaultRequestHeaders.Clear();
-            http.DefaultRequestHeaders.Add("x-api-key",          opts.Value.AnthropicKey);
-            http.DefaultRequestHeaders.Add("anthropic-version",   "2023-06-01");
+            http.DefaultRequestHeaders.Add("x-api-key",        opts.Value.AnthropicKey);
+            http.DefaultRequestHeaders.Add("anthropic-version", "2023-06-01");
 
             var content  = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
             var response = await http.PostAsync("v1/messages", content);
@@ -613,10 +662,23 @@ public class AnthropicService(IOptions<AppConfig> opts, IHttpClientFactory facto
 
             if (!response.IsSuccessStatusCode)
             {
-                Console.WriteLine($"[ai] Anthropic {(int)response.StatusCode}: {body[..Math.Min(200, body.Length)]}");
-                return Results.Json(JsonDocument.Parse(body).RootElement, statusCode: (int)response.StatusCode);
+                Console.WriteLine($"[ai] Anthropic error {(int)response.StatusCode}: {body[..Math.Min(200, body.Length)]}");
+                // Return error as JSON
+                try
+                {
+                    using var errDoc = JsonDocument.Parse(body);
+                    return Results.Json(errDoc.RootElement, statusCode: (int)response.StatusCode);
+                }
+                catch
+                {
+                    return Results.Json(new { error = body[..Math.Min(200, body.Length)] }, statusCode: (int)response.StatusCode);
+                }
             }
-            return Results.Json(JsonDocument.Parse(body).RootElement);
+
+            // Parse Anthropic response and return directly
+            // Shape: { id, type, role, content:[{type,text}], model, stop_reason, usage }
+            using var respDoc = JsonDocument.Parse(body);
+            return Results.Json(respDoc.RootElement);
         }
         catch (Exception e)
         {
