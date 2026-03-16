@@ -2002,9 +2002,12 @@ const CONN_TESTS = [
     if(!b) throw new Error('ตั้งค่า API Key ก่อน');
     const r=await fetch(`${b}/api/spark?symbol=AAPL&range=1mo`,{headers:{'X-API-Key':key},signal:abortAfter(10000)});
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
-    const d=await r.json();
-    if(!d.count||d.count<2) throw new Error('ข้อมูลน้อยเกิน: '+d.count);
-    return `${d.count} candles | range:${d.range} | src:${d._src||'?'}`;
+    const resp=await r.json();
+    // .NET returns { ok, data: { timestamps, closes, count, _src } }
+    const d = resp.data || resp;
+    const count = d.count || d.Count || (d.timestamps||d.Timestamps||[]).length || 0;
+    if(count < 1) throw new Error('ไม่มีข้อมูล spark — Finnhub free อาจไม่รองรับ');
+    return `${count} points | src:${d.source||d._src||d.Source||'finnhub'}`;
   }},
   // 4. Fear & Greed
   { id:'fg', name:'😱 /api/fear-greed', critical:false, fn:async()=>{

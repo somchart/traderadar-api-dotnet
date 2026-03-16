@@ -219,11 +219,10 @@ app.MapGet("/api/spark", async (
         return Results.Ok(new { ok = true, cached = true, symbol = sym, range = r, data = hit });
 
     var data = await fh.GetCandlesAsync(sym, r);
-    if (data is null)
-        return Results.Json(new { error = $"No chart data for {sym}" }, statusCode: 502);
-
-    cache.Set(cacheKey, data);
-    return Results.Ok(new { ok = true, cached = false, symbol = sym, range = r, data });
+    // Always return 200 — empty SparkResult means "no data available" (not an error)
+    var sparkData = data ?? new SparkResult { Timestamps=[], Closes=[], Opens=[], Highs=[], Lows=[], Volumes=[], Count=0, Source="unavailable" };
+    cache.Set(cacheKey, sparkData, sparkData.Count > 0 ? TimeSpan.FromMinutes(5) : TimeSpan.FromMinutes(1));
+    return Results.Ok(new { ok = true, cached = false, symbol = sym, range = r, data = sparkData });
 });
 
 app.MapGet("/api/search", async (
@@ -577,32 +576,42 @@ public class FinnhubService(IOptions<AppConfig> opts, SymbolMapConfig symMap, IH
         if (string.IsNullOrEmpty(opts.Value.FinnhubKey)) return null;
         try
         {
-            // Get current quote to use as the data point
             var quote = await GetQuoteAsync(sym);
-            if (quote?.RegularMarketPrice is null) return null;
 
-            // Build a minimal synthetic SparkResult with today's OHLC
-            // This gives the chart something to display even on free tier
-            var nowTs   = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            var prevTs  = nowTs - 86400;
+            // If no quote data, return a placeholder so the chart renders (not 502)
+            if (quote?.RegularMarketPrice is null)
+            {
+                // Return empty-but-valid result — chart will show "no data" gracefully
+                return new SparkResult
+                {
+                    Timestamps = [], Closes = [], Opens = [],
+                    Highs = [], Lows = [], Volumes = [],
+                    Count = 0, Source = "no-data",
+                };
+            }
 
-            // Use previous close and today's data to create 2 points
+            var nowTs     = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var prevTs    = nowTs - 86400;
             var prevClose = quote.RegularMarketPreviousClose ?? quote.RegularMarketPrice.Value;
-            var curPrice  = quote.RegularMarketPrice.Value;
+            var cur       = quote.RegularMarketPrice.Value;
 
             return new SparkResult
             {
                 Timestamps = [prevTs, nowTs],
-                Closes     = [Math.Round(prevClose, 4), Math.Round(curPrice,  4)],
-                Opens      = [Math.Round(prevClose, 4), Math.Round(quote.RegularMarketOpen      ?? curPrice, 4)],
-                Highs      = [Math.Round(prevClose, 4), Math.Round(quote.RegularMarketDayHigh   ?? curPrice, 4)],
-                Lows       = [Math.Round(prevClose, 4), Math.Round(quote.RegularMarketDayLow    ?? curPrice, 4)],
+                Closes     = [Math.Round(prevClose, 4), Math.Round(cur, 4)],
+                Opens      = [Math.Round(prevClose, 4), Math.Round(quote.RegularMarketOpen    ?? cur, 4)],
+                Highs      = [Math.Round(prevClose, 4), Math.Round(quote.RegularMarketDayHigh ?? cur, 4)],
+                Lows       = [Math.Round(prevClose, 4), Math.Round(quote.RegularMarketDayLow  ?? cur, 4)],
                 Volumes    = [null, quote.RegularMarketVolume],
                 Count      = 2,
-                Source     = "finnhub-quote-synthetic",
+                Source     = "finnhub-synthetic",
             };
         }
-        catch (Exception e) { Console.WriteLine($"[spark] {sym}: {e.Message}"); return null; }
+        catch (Exception e)
+        {
+            Console.WriteLine($"[spark] {sym}: {e.Message}");
+            return new SparkResult { Timestamps=[], Closes=[], Opens=[], Highs=[], Lows=[], Volumes=[], Count=0, Source="error" };
+        }
     }
 
     public async Task<List<SearchResult>> SearchAsync(string q)
@@ -634,48 +643,36 @@ public class AnthropicService(IOptions<AppConfig> opts, IHttpClientFactory facto
     {
         try
         {
-            // Parse incoming request
-            using var doc  = JsonDocument.Parse(requestBody);
-            var payload    = doc.RootElement.EnumerateObject()
-                               .ToDictionary(p => p.Name, p => p.Value);
+            // Parse and rebuild payload (avoid JsonDocument disposal issues)
+            using var reqDoc = JsonDocument.Parse(requestBody);
+            var payloadDict  = reqDoc.RootElement.EnumerateObject()
+                                  .ToDictionary(p => p.Name, p => p.Value.Clone()); // Clone before disposal
 
-            // Inject model if not specified
-            if (!payload.ContainsKey("model"))
-                payload["model"] = JsonDocument.Parse("\"claude-sonnet-4-20250514\"").RootElement;
+            if (!payloadDict.ContainsKey("model"))
+                payloadDict["model"] = JsonDocument.Parse("\"claude-sonnet-4-20250514\"").RootElement.Clone();
 
-            // Call Anthropic
+            var payloadJson = JsonSerializer.Serialize(payloadDict);
+
             var http = factory.CreateClient("anthropic");
             http.DefaultRequestHeaders.Clear();
             http.DefaultRequestHeaders.Add("x-api-key",        opts.Value.AnthropicKey);
             http.DefaultRequestHeaders.Add("anthropic-version", "2023-06-01");
 
-            var content  = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-            var response = await http.PostAsync("v1/messages", content);
-            var body     = await response.Content.ReadAsStringAsync();
+            var response = await http.PostAsync("v1/messages",
+                new StringContent(payloadJson, Encoding.UTF8, "application/json"));
+            var responseBody = await response.Content.ReadAsStringAsync();
+
+            Console.WriteLine($"[ai] Anthropic {(int)response.StatusCode}: {responseBody[..Math.Min(100, responseBody.Length)]}");
 
             if (!response.IsSuccessStatusCode)
-            {
-                Console.WriteLine($"[ai] Anthropic error {(int)response.StatusCode}: {body[..Math.Min(200, body.Length)]}");
-                // Return error as JSON
-                try
-                {
-                    using var errDoc = JsonDocument.Parse(body);
-                    return Results.Json(errDoc.RootElement, statusCode: (int)response.StatusCode);
-                }
-                catch
-                {
-                    return Results.Json(new { error = body[..Math.Min(200, body.Length)] }, statusCode: (int)response.StatusCode);
-                }
-            }
+                return Results.Content(responseBody, "application/json", statusCode: (int)response.StatusCode);
 
-            // Parse Anthropic response and return directly
-            // Shape: { id, type, role, content:[{type,text}], model, stop_reason, usage }
-            using var respDoc = JsonDocument.Parse(body);
-            return Results.Json(respDoc.RootElement);
+            // Return raw JSON string directly — avoids JsonDocument disposal bug
+            return Results.Content(responseBody, "application/json");
         }
         catch (Exception e)
         {
-            Console.WriteLine($"[ai] Proxy error: {e.Message}");
+            Console.WriteLine($"[ai] Proxy error: {e.Message}\n{e.StackTrace?[..Math.Min(300, e.StackTrace?.Length ?? 0)]}");
             return Results.Json(new { error = e.Message }, statusCode: 502);
         }
     }
