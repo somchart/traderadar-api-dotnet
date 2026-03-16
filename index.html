@@ -735,112 +735,79 @@ async function apiFetch(endpoint){
   return res.json();
 }
 
-// Last-resort fallback: allorigins proxy (only used if Railway proxy fails)
+// yfDirect: no longer used for Yahoo (blocked from all proxies)
+// Kept as stub to avoid breaking any remaining call sites
 async function yfDirect(url){
-  try {
-    const r=await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,{signal:AbortSignal.timeout(12000)});
-    const j=await r.json(); return JSON.parse(j.contents);
-  } catch(e) {
-    throw new Error('All data sources failed: '+e.message);
-  }
+  console.warn('[yfDirect] Yahoo Finance is blocked - returning empty');
+  throw new Error('Yahoo Finance unavailable - using Railway backend');
 }
 
 async function yfQuote(syms){
   const k='q_'+syms; const h=gc(k); if(h)return h;
-  let d;
-  const configured = window.BACKEND_URL && !window.BACKEND_URL.includes('YOUR-APP');
+  const EMPTY = { quoteResponse:{ result:[], error:null } };
 
-  if(configured){
-    try{
-      const resp = await apiFetch(`/api/quote?symbols=${encodeURIComponent(syms)}`);
-      if(!resp.ok && !resp.quotes) throw new Error(resp.error||'no quotes');
-      // v5 backend returns {ok, quotes:[...]} — wrap into Yahoo-compatible shape
-      d = { quoteResponse:{ result: resp.quotes||[], error:null } };
-      dot('dot-yf','ok');
-      sc(k,d); return d;
-    }catch(e){
-      console.warn('[yfQuote] backend error:',e.message,'— trying proxy fallback');
-      dot('dot-yf','warn');
-    }
-  }
-
-  // Proxy fallback
-  try {
-    d = await yfDirect(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(syms)}&fields=symbol,shortName,regularMarketPrice,regularMarketChange,regularMarketChangePercent,regularMarketVolume,averageVolume,fiftyTwoWeekHigh,fiftyTwoWeekLow,fiftyDayAverage,twoHundredDayAverage,trailingPE,forwardPE,marketCap,dividendYield`);
+  try{
+    const resp = await apiFetch(`/api/quote?symbols=${encodeURIComponent(syms)}`);
+    if(!resp.quotes?.length) throw new Error(resp.error||'no quotes returned');
+    const d = { quoteResponse:{ result: resp.quotes, error:null } };
     dot('dot-yf','ok');
-  } catch(e2){
-    // Return empty but valid structure so UI doesn't crash
-    console.warn('[yfQuote] proxy also failed:',e2.message);
-    dot('dot-yf','err');
-    d = { quoteResponse:{ result:[], error: e2.message } };
+    sc(k,d); return d;
+  }catch(e){
+    console.warn('[yfQuote]',syms.split(',')[0],'—',e.message);
+    dot('dot-yf','warn');
+    sc(k,EMPTY,15000); // short cache — retry soon
+    return EMPTY;
   }
-  sc(k,d); return d;
 }
 
 async function yfSpark(sym){
   const k='spark_'+sym; const h=gc(k); if(h)return h;
-  let d;
   const configured = window.BACKEND_URL && !window.BACKEND_URL.includes('YOUR-APP');
+  const EMPTY = { spark:{ result:[{ response:[{ timestamp:[], meta:{}, indicators:{ quote:[{}] } }] }] }};
 
-  if(configured){
+  if(configured || location.hostname.includes('netlify')){
     try{
-      const resp = await apiFetch(`/api/spark?symbol=${encodeURIComponent(sym)}`);
-      if(!resp.count && !resp.closes) throw new Error(resp.error||'no spark data');
-      // v5: backend returns {closes, timestamps, opens, highs, lows, volumes, count} directly
-      d = { spark:{ result:[{ response:[{
-        timestamp:  resp.timestamps||[],
-        meta:       resp.meta||{},
-        indicators: { quote:[{
-          close:  resp.closes||[],
-          open:   resp.opens||[],
-          high:   resp.highs||[],
-          low:    resp.lows||[],
-          volume: resp.volumes||[],
-        }]}
-      }]}]}};
-      dot('dot-sp','ok');
-      sc(k,d,55000); return d;
+      const resp = await apiFetch(`/api/spark?symbol=${encodeURIComponent(sym)}&range=1mo`);
+      // .NET backend returns: { ok, cached, symbol, range, data: { timestamps, closes, opens, highs, lows, volumes, count } }
+      const d2 = resp.data || resp; // handle both shapes
+      const ts = d2.timestamps || d2.Timestamps || [];
+      if(ts.length > 0){
+        const d = { spark:{ result:[{ response:[{
+          timestamp:  ts,
+          meta:       { regularMarketPrice: d2.meta?.regularMarketPrice || d2.Meta?.regularMarketPrice },
+          indicators: { quote:[{
+            close:  d2.closes  || d2.Closes  || [],
+            open:   d2.opens   || d2.Opens   || [],
+            high:   d2.highs   || d2.Highs   || [],
+            low:    d2.lows    || d2.Lows    || [],
+            volume: d2.volumes || d2.Volumes || [],
+          }]}
+        }]}]}};
+        dot('dot-sp','ok');
+        sc(k,d,300000);
+        return d;
+      }
+      throw new Error('empty timestamps');
     }catch(e){
-      console.warn('[yfSpark] backend:',e.message,'— direct fallback');
+      console.warn('[yfSpark]',sym,e.message);
       dot('dot-sp','warn');
     }
   }
 
-  // Direct fallback
-  d = await yfSparkDirect(sym);
-  sc(k,d,55000); return d;
+  // No fallback to Yahoo — it's blocked. Return empty so chart shows gracefully.
+  sc(k,EMPTY,30000); // short cache so it retries soon
+  return EMPTY;
 }
 
-async function yfSparkDirect(sym){
-  // Direct fallback: use chart endpoint via proxy
-  try {
-    const url=`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m&includePrePost=false`;
-    return yfDirect(url).then(data=>{
-      const r=data?.chart?.result?.[0];
-      if(!r) throw new Error('No chart data');
-      return { spark:{ result:[{ response:[{
-        timestamp: r.timestamp||[],
-        meta: r.meta||{},
-        indicators:{ quote:[r.indicators?.quote?.[0]||{}] }
-      }]}]}};
-    });
-  } catch(e2) {
-    return { spark:{ result:[{ response:[{ timestamp:[], meta:{}, indicators:{ quote:[{}] } }] }] }};
-  }
-}
+function yfSparkDirect(){ return { spark:{ result:[{ response:[{ timestamp:[], meta:{}, indicators:{ quote:[{}] } }] }] }}; }
+
 
 async function yfSearch(q){
-  const configured = window.BACKEND_URL && !window.BACKEND_URL.includes('YOUR-APP');
-  if(configured){
-    try{
-      const resp = await apiFetch(`/api/search?q=${encodeURIComponent(q)}`);
-      return { quotes: (resp.quotes||[]).map(r=>({symbol:r.symbol,shortname:r.shortname,typeDisp:r.type,exchDisp:r.exchange})) };
-    }catch(e){ console.warn('[yfSearch] backend:',e.message); }
-  }
-  try {
-    const url=`https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=7&newsCount=0`;
-    return yfDirect(url);
-  } catch(e) {
+  try{
+    const resp = await apiFetch(`/api/search?q=${encodeURIComponent(q)}`);
+    return { quotes: (resp.quotes||[]).map(r=>({symbol:r.symbol,shortname:r.shortname,typeDisp:r.type,exchDisp:r.exchange})) };
+  }catch(e){
+    console.warn('[yfSearch]',e.message);
     return { quotes: [] };
   }
 }
