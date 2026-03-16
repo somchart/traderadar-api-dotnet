@@ -11,6 +11,10 @@ using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// ── PORT — Railway injects PORT at runtime, must bind before Build() ─────────
+var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
+builder.WebHost.UseUrls($"http://+:{port}");
+
 // ── IConfiguration is auto-loaded from:
 //    1. appsettings.json
 //    2. appsettings.{Environment}.json
@@ -18,7 +22,7 @@ var builder = WebApplication.CreateBuilder(args);
 //    4. Command-line args
 //
 // Railway env var mapping:  TradeRadar__ApiKey  →  TradeRadar:ApiKey
-// (double-underscore = colon separator for nested sections)
+// (double underscore = colon separator for nested config sections)
 // ─────────────────────────────────────────────────────────────────────────────
 
 builder.Services.Configure<AppConfig>(builder.Configuration.GetSection("TradeRadar"));
@@ -352,10 +356,6 @@ app.MapGet("/api/cache/clear", (CacheService cache) =>
     Results.Ok(new { ok = true, cleared = cache.Clear() }));
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-// Railway sets PORT env var at runtime. We override ASPNETCORE_URLS so it binds correctly.
-var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
-Environment.SetEnvironmentVariable("ASPNETCORE_URLS", $"http://+:{port}");
-
 var startupCfg = app.Services.GetRequiredService<IOptions<AppConfig>>().Value;
 Console.WriteLine($"""
 ╔═══════════════════════════════════════════╗
