@@ -2046,13 +2046,20 @@ const CONN_TESTS = [
       body:JSON.stringify({messages:[{role:'user',content:'Say OK'}],max_tokens:10}),
       signal:abortAfter(25000),
     });
-    if(r.status===503){const d=await r.json().catch(()=>({}));throw new Error('ต้อง add ANTHROPIC_KEY ใน Railway Variables');}
-    if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(String(d.error||'HTTP '+r.status));}
-    const d=await r.json();
-    if(d.error) throw new Error(typeof d.error==='object'?JSON.stringify(d.error):String(d.error));
-    const text = Array.isArray(d.content)?d.content[0]?.text||'':String(d.content||'');
-    const model = typeof d.model==='string'?d.model.split('-').slice(0,2).join('-'):'claude';
-    return `✅ ${model} | "${text.slice(0,20)}"`;
+    const d=await r.json().catch(()=>({}));
+    // Handle all error cases with clear messages
+    if(r.status===503) throw new Error('ANTHROPIC_KEY ยังไม่ได้ตั้งใน Railway Variables — ไปที่ console.anthropic.com → API Keys');
+    if(!r.ok){
+      const errMsg = typeof d.error==='object' ? JSON.stringify(d.error) : String(d.error||`HTTP ${r.status}`);
+      throw new Error(errMsg);
+    }
+    if(d.error){
+      throw new Error(typeof d.error==='object' ? JSON.stringify(d.error) : String(d.error));
+    }
+    const text  = Array.isArray(d.content) ? (d.content[0]?.text||'') : '';
+    const model = typeof d.model==='string' ? d.model.split('-').slice(0,3).join('-') : 'claude';
+    if(!text) throw new Error('Response มีแต่ไม่มี text — ดู Railway logs');
+    return `✅ ${model} | "${text.slice(0,25)}"`;
   }},
   // 8. Fear & Greed direct (alternative.me, no proxy needed)
   { id:'proxy', name:'🌐 alternative.me (direct)', critical:false, fn:async()=>{
@@ -2135,39 +2142,67 @@ function updateClocks(){
 // ============================================================
 async function refreshAll(){
   const btn=document.getElementById('rbtn');
-  btn.classList.add('loading');btn.textContent='↻ โหลด...';
+  btn.classList.add('loading'); btn.textContent='↻ โหลด...';
   Object.keys(CACHE).forEach(k=>delete CACHE[k]);
+  // Pre-fetch all quotes first (2 batches), then render
+  await prefetchAllQuotes();
   await Promise.allSettled([
-    loadBar(),loadDXY(),loadFG(),
+    loadBar(), loadDXY(), loadFG(),
     loadList(THAI_LIST,'list-thai','฿'),
     loadList(GLOBAL_LIST,'list-global','$'),
-    loadGold(),loadHeatmap(),
+    loadGold(), loadHeatmap(),
   ]);
   if(techSym&&window._techLoaded) loadTechChart(techSym);
-  btn.classList.remove('loading');btn.textContent='↻ รีเฟรช';
+  btn.classList.remove('loading'); btn.textContent='↻ รีเฟรช';
 }
 
 // ============================================================
 // INIT
 // ============================================================
 (async()=>{
-  // Load saved backend config from sessionStorage first
   loadSavedConfig();
   updateClocks();
   setInterval(updateClocks,1000);
+
+  // ── PRE-FETCH all symbols in 2 sequential batches to avoid Finnhub rate limit ──
+  // Batch 1: US stocks + indices (most important, shown on top)
+  // Batch 2: Thai stocks + sector ETFs
+  // Each batch = 1 API call → sequential = max 2 Finnhub calls instead of 30+
+  await prefetchAllQuotes();
+
+  // Then load all UI components (they read from cache, very fast)
   await Promise.allSettled([
-    loadBar(),loadDXY(),loadFG(),
+    loadBar(), loadDXY(), loadFG(),
     loadList(THAI_LIST,'list-thai','฿'),
     loadList(GLOBAL_LIST,'list-global','$'),
-    loadGold(),loadHeatmap(),
+    loadGold(), loadHeatmap(),
   ]);
-  // Auto-load tech chart
+
   window._techLoaded=false;
-  loadTechChart('GC=F');window._techLoaded=true;
-  setInterval(refreshAll,60000);
-  // Resize charts on window resize
+  loadTechChart('GC=F'); window._techLoaded=true;
+  setInterval(refreshAll, 60000);
   window.addEventListener('resize',()=>{if(techSym)loadTechChart(techSym);});
 })();
+
+async function prefetchAllQuotes(){
+  // Batch 1: bar symbols + US stocks + gold
+  const batch1 = [
+    ...BAR_SYMS,
+    ...GLOBAL_LIST.map(s=>s.sym),
+    'GC=F','GLD','THBX=X','DX-Y.NYB',
+  ].filter((s,i,a)=>a.indexOf(s)===i); // deduplicate
+
+  // Batch 2: Thai stocks + sector ETFs
+  const batch2 = [
+    ...THAI_LIST.map(s=>s.sym),
+    ...SECTOR_ETFS.map(s=>s.sym),
+  ].filter((s,i,a)=>a.indexOf(s)===i);
+
+  // Fire batch1, wait, then batch2 (sequential to respect rate limit)
+  try { await yfQuote(batch1.join(',')); } catch(e){ console.warn('[prefetch] batch1:',e.message); }
+  await new Promise(r=>setTimeout(r,500)); // 500ms gap
+  try { await yfQuote(batch2.join(',')); } catch(e){ console.warn('[prefetch] batch2:',e.message); }
+}
 
 document.getElementById('aiq').addEventListener('keydown',e=>{if(e.key==='Enter')askAI();});
 

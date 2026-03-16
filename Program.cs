@@ -193,12 +193,12 @@ app.MapGet("/api/quote", async (
         app.Logger.LogWarning("[quote] no data for: {Syms}", string.Join(", ", failed));
 
     if (quotes.Count == 0)
-        return Results.Json(new
-        {
-            error  = "No quotes returned. Ensure FINNHUB_KEY is configured.",
-            failed,
-            hint   = "Railway Variables → FINNHUB_KEY (free at finnhub.io)"
-        }, statusCode: 502);
+    {
+        // Return 200 with empty quotes so frontend can show "—" gracefully
+        // (502 causes browser to log errors and makes debugging confusing)
+        app.Logger.LogWarning("[quote] all symbols failed: {Syms}", string.Join(",", syms));
+        return Results.Ok(new { ok = false, cached = false, count = 0, quotes = Array.Empty<object>(), failed, hint = "Check FINNHUB_KEY in Railway Variables", ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+    }
 
     cache.Set(cacheKey, quotes);
     return Results.Ok(new { ok = true, cached = false, count = quotes.Count, quotes, failed, ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
@@ -442,10 +442,11 @@ public class FinnhubService(IOptions<AppConfig> opts, SymbolMapConfig symMap, IH
     public AppConfig          Config      => opts.Value;
     public IHttpClientFactory HttpFactory => factory;
 
-    // Throttle: 200ms between calls = 5/sec (free tier limit = 60/min)
+    // Throttle: 300ms between calls = ~3/sec (free tier = 60/min)
+    // With batched frontend requests, this is sufficient
     private readonly SemaphoreSlim _gate     = new(1, 1);
     private          DateTime      _lastCall = DateTime.MinValue;
-    private const    int           ThrottleMs = 200;
+    private const    int           ThrottleMs = 300;
 
     private async Task<string> FhGetAsync(string path)
     {
